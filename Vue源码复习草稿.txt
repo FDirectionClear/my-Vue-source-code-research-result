@@ -1,0 +1,204 @@
+一、 从入口开始
+1、import 导入 Vue
+  （1）创建Vue的构造函数，执行this._init方法，之后在执行initMixin, stateMixin, extentMixin
+之类的东西，他们就是为了扩展Vue.prototype的。
+   之所以把initMixin....xxxMixin都单独写出来，而没有用class，是因为这样可以按模块去分割他们的逻辑，
+。如果用class就得在同一个文件中吧这些Mixin都写进去。
+  （2）initGlobalAPI。
+   就是为Vue的原型上扩展一些方法，还会给Vue本身扩展全局静态方法。Vue.set, delete, nextTick
+都是在这里被创建的。还有Vue.options[componets.....]啥的都是在这里创建的。Vue官网中关于
+全局API都可以在这里找到。
+  （3）定义没有runtime的Vue.prototype.$mount公用方法。以及一些Vue.config上的属性和方法
+  （4）定义有runtime版本的Vue.prototype的公用方法，其中混合调用了上一个$mount。
+最后export Vue即完成最终Vue函数构造。
+
+TIP: 如果是runtime only版本的Vue应该就没有第（4）步。
+
+
+二、数据驱动（将如何静态渲染dom的）
+1、new Vue的时候都发生了什么？
+  （1）通过 this instanceof Vue 判断当前this指向的是不是Vue。如果不是Vue，说明当前的Vue
+构造函数调用环境可能不是通过new操作符调用的。
+  （2）执行this._init方法（对于根实例而言，不是组件而言）。
+	1）将参数options融合至vm.$options，vm就是this，也就是当前Vue根实例。
+	2）初始化Lifecycle、初始化events、调用beforeCreate生命周期函数，初始化
+	初始化injections、state（data/props/computed/watcher...）和provide，调用
+	created生命周期函数。
+	3）根据vm.$options.el是否存在判断是否应该执行当前实例的$mount去挂载。
+
+TIP：Vue的构造函数似乎不能阻止用户通过bind,call,apply的调用。
+
+2、Vue实例挂载的实现（runtime + compiler版本的Vue.prototype.$mount方法实现）
+  （1）缓存runtime only的$mount（mount），runtime only的$mount调用了mountComponent去进一步
+挂载，但是需要现成的render函数。复写的Vue.prototype.$mount只是添加了compile的功能，主
+要任务是将el,templete编译成render函数。
+  （2）如果el存在就拿到el，并通过query把el解析成真正的dom
+  （3）判断一下el的挂载目标，如果挂载的目标是body或者是html文档根元素（document.documentElement）
+就报错并终止运行。
+  （4）render优先，先判断render函数是已经存在（主要针对compiler版本的Vue，经过了Vue
+-loader的解析）。如果存在render，说明自己编写的render，直接进mount。
+  （5）template次优先，template有四种情况：
+	1）template字符串，是一个id选择器。那就直接调用IdToTemlate方法去获取选择器
+	对应的dom模板。idToTemplate的方法没讲过，但是应该就是对x-template中InnerHtml
+	获取dom模板。
+	2）template是手写的字符串，那就直接保留，什么都不需要做。
+	3）template如果是一个现成的dom节点，就获取他的innerHTML
+	4）template没写（对于根实例而言大多数的情况），那就把el对应的dom获取outerHTML，也就是el是次次优先的。
+	经过以上4中情况，最终都会获得一个字符串类型的dom模板，这个dom模板就会覆盖
+	template变量。
+  （6）如果template经过第（5）的转变后存在，就调用compileToFunctions函数转变为render函数。
+  （7）最后mount.call(this, el)
+
+TIP: runtime + compiler版本的Vue.prototype.$mount可能会在this._init执行的时候被调用。
+这取决于vm.$options中是否有el。
+
+3、$mount中执行的mountComponent
+  在决定挂载后（el存在），也有了render函数，是时候应该挂载了。只需要为mountComponet
+提供挂载位置目标el，vm实例即可（主要是vm实例中的render函数）。
+  （1）先判断是否有render，经过之前的步骤，正常情况下此时一定已经有render函数（可能是
+在线编译的，也可能是vue-loader编译好的），如果没有render函数，说明现在只获取到了template
+模板，template模板还没有编译为render函数，这很可能是runtime only的版本，且没有使用
+vue-loader。此时应该报错。或者render函数有，但是render是用户定义的，此时为undefiend。
+那也应该报错。
+  （2）在确定render函数存在之后，调用beforeMount钩子。
+  （3）因为初次渲染会访问到变量，从而触发模板中变量的setter进行派发更新，所以此时渲染
+Watcher会触发回调函数updateComponent，从而调用vm._update()方法去进行渲染dom，
+vm._update方法渲染dom需要VNode,因此它的的第一个参数是VNode。这时就需要调用
+vm._render函数去获取VNode。
+	vm.render实现如下：
+	先获取vm.options中的render，然后render.call(..., vm.$createElement),因此
+	我们手写的render函数的第一个参数其实就是$createElement这个方法。
+	$createElement的实现过程见5节
+	
+4、Virtual DOM
+  （1）Virtual DOM就是用一个原生JS对象去描述一个DOM节点，他比要创建一个DOM的代价要小
+很多。
+  （2）关于Virtual DOM的详细介绍请看：https://juejin.im/post/59b53a595188257e7406fe3d
+
+5、createElement的实现
+    createElement其实是_createElement方法的封装，_createElement主要做了两件事情：
+children的规范化、生成VNode。
+  （1）children的规范化
+	之所以要规范化是因为children的用途是用来构建VNode，VNode是一个树形结构，VNode
+	的children属性就是一个数组，所以我们希望规范化出来的children就是一个数组。children中
+	的VNode节点都是兄弟节点，就和DOM树的结构一样。
+
+	而我们手写的render函数的子节点可以是任意类型的，可以是String，可以是Number，可以
+	是Array，甚至也可以是Boolean，当然也可以是undefined或者null。另外，对于slot和v-for等编译出来的结果也是一个vnode
+	数组。而我们的最终目标是将用户手写的children规范成一个数组。
+
+	这些render函数的子节点对于同级兄弟节点的关系表达可能不是很清晰，比如，和某个子节点a
+	的同级兄弟节点可能是一个数组，数组就不是一个节点，他就是一个很模糊的描述，这个数组
+	还可能中还可能存在数组，但是将这些数组扁平化之后，数组中的所有节点其实都是节点a的兄
+	弟节点，等价于不存在数组直接列举各个子节点的情况。
+	如：
+	export default {
+    render: (h) => {
+        return h('div',{
+            attrs: {
+                id: 'app'
+            }
+        },[
+            [
+                h(App1),
+                'some text child nodes... 1'
+            ],
+            this.$slots.default,
+            'some text child nodes... 2',
+            h(App2, 'child-child-text'),
+            h('my-component')
+        ])
+    }
+}
+
+	我们的手写的children是一个数组，第一项也是个数组，下面的slot在编译过后还是一个数组。
+	但是无论是我们手写的数组，还是插槽生成的数组，他们中的成员和'some text child nodes... 2',
+	这个子节点都是同级元素。和以下的结果是一样的。
+	[
+	    h(App1),
+	    'some text child nodes... 1',
+	    this.$slots.default中的元素....,
+            	    'some text child nodes... 2',
+            	    h(App2，'child-child-text'),
+            	    h('my-component')
+	]
+	但是现在还有一个问题
+	在这个数组中有h(),String，其中h中的内容还不一样，第一个参数可以是组件，也可以是字符串。
+	先不管h的参数是什么，他最终都返回一个vnode，这是没有问题的。但对于字符串节点而言,
+	诸如：'some text child nodes... 1'和'some text child nodes... 2'。他们并不是vnode,我们
+	还需要对他们进行处理，把他们变成textVnode才行。
+	所以在创建VNode实例的时候，我们需要的children的数据结构是类似这样的：
+	[
+    	    vnode: {},
+    	    vnode: {},
+    	    vnode: {},
+    	    vnode: {},
+    	    vnode: {},
+    	    vnode: {
+	        children: [	
+		vnode: {}	
+	        ]
+	    },
+    	    vnode: {},
+	]
+	简而言之，整个序列化的过程就是把最开始手写的render函数中的children变成上面这种
+	全员都是vnode类型，且结构分明的树状结构。
+	
+	再来看代码实现：
+	1）先判断createElement的子节点是不是一个数组，如果不是数组就直接创建textVnode，
+	并把这个textVnode包装成一个数组返回。如果是一个数组，则通过normalizeArrayChildren
+	遍历这个数组，先对每一项的类型做一个判断，如果当前是数组类型，就递归调用
+	normalizeArrayChildren去做一个递归，将数组扁平化。扁平化的核心办法是：
+	res.push.apply(res, [...])
+  （2）创建Vnode
+	不要忘记createElement的职责是返回template对应的vnode，然后vm._update方法才能通过
+vnode进行真实dom渲染。
+	1）先判断createElement的第一项tag是否是一个字符串，如果是就进而判断是不是已经注册
+了的组件名，如果是就利用createComponent创建一个组件vnode，如果是平台保留标签，就创建一个
+普通vnode，如果tag不是字符串，那就是一个组件了，就直接利用createComponent来创建一个组件
+vnode。
+	至此，我们已经把获取template、template变成render函数之后转换为vnode的过程讲完，
+接下来回到vm._update，去研究vnode渲染为真实dom，并挂载到dom树上的过程。
+
+6、update的实现
+   update函数作为全局的渲染watcher的回调函数，有两种时机会被调用：初次渲染时 和 组件发生更新
+时。这里先着重要论组件渲染时。update在拿到render函数提供的vnode后，结合传进来的vm.$el,就会
+开始挂载。update函数渲染并挂载dom的过程主要是通过vm.__patch__方法。
+  （1）patch函数根据平台不同，和所在环境不同，所作出的行为不同，在服务端和服务端渲染时，都不
+需要用patch函数对dom进行挂载。只有在web平台的非服务端渲染时才会挂载dom。这种逻辑区分是通
+过柯里化产生的。vm.__patch__是patch经过柯里化产生的最终结果。
+  （2）在得到正真需要的patch函数后，首先先对获取oldVnode，对于首次渲染，oldVnode就是传进来
+的$el，此时的$el作为container还是一个真实的dom，在把$el转化为emptyvnode。然后退一步获取$el
+的父级元素parentElm。
+  （3）将render函数得到的vnode和parentElm带入createElm方法中。createElm才是真正根据vnode创
+建真实dom并进行挂载的真正能手。
+
+7、createElm
+    有了vnode和挂载的目标parentElm（首次渲染parentElm是body,注意是$el的父节点，也就是说
+是要替换掉$el的），createElm就可以根据vnode的tag通过递归的方式一层一层的创建dom节点。
+  （1）先判断vnode是不是组件vnode，判断方法是通过createComponent方法，如果是组件vnode就
+不执行createElm，组件自有自己的挂载的方法。
+  （2）不是组件vnode，那就开始判断tag是不是一个vue认识的标签，如果是，就通过原生方法创建一个
+占位符节点。然后调用createChildren方法去为当前的vnode的children创建dom节点。
+  （3）createChildren方法主要就是遍历children的每一个vnode，参数中有createElm创建的占位符节点，
+这个占位符节点就是createChildren应该插入的父节点，如果children的当前项是一个普通的vnode，那就
+递归的调用createElm去创建dom节点，带入的参数为当前child的vnode和当前的占位符节点，因为是递
+归，所以在递归的每一层中都会记录着当前应该插入的父节点。如果是文本节点，那他没有children，直接
+将文本节点插入占位符节点即可，然后遍历下一个节点。当子节点都创建完毕之后，是时候挂载‘祖先’
+节点，也就是最外层的占位符节点，直接把他挂载到parentElm上即可。
+   可以看到，vue在通过vnode挂载dom的时候是通过深度优先的方式，但是创建dom并非深度优先。
+深度优先的只是挂载而已。
+
+
+四、 深入响应式原理
+    对于数据渲染的部分和组件化的部分已经明晰，但是对于数据双向绑定的实现还没有的得到一个清晰的解释。
+现在我们来看看vue的响应式原理是如何实现的。
+  
+
+	
+	
+
+
+
+
+  
